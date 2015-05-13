@@ -1,0 +1,273 @@
+#!/usr/bin/python
+#coding: utf-8 -*-
+
+# (c) 2013, Benno Joy <benno@ansibleworks.com>
+# (c) 2015, Beat Fuellemann <bfuellemann@ansibleworks.com>
+#
+# This module is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software. If not, see <http://www.gnu.org/licenses/>.
+
+try:
+    from neutronclient.neutron import client
+    from keystoneclient.v2_0 import client as ksclient
+except ImportError:
+    print("failed=True msg='neutronclient and keystone client are required'")
+
+DOCUMENTATION = '''
+---
+module: neutron_port
+version_added: "1.0"
+short_description: Creates/Removes ports from a network in OpenStack
+description:
+   - Add or Remove ports from a network in OpenStack.
+   - Allows to set a fixed ip address to the port.
+options:
+   login_username:
+     description:
+        - login username to authenticate to keystone
+     required: true
+     default: admin
+   login_password:
+     description:
+        - Password of login user
+     required: true
+     default: 'yes'
+   login_tenant_name:
+     description:
+        - The tenant name of the login user
+     required: true
+     default: 'yes'
+   auth_url:
+     description:
+        - The keystone url for authentication
+     required: false
+     default: 'http://127.0.0.1:35357/v2.0/'
+   region_name:
+     description:
+        - Name of the region
+     required: false
+     default: None
+   state:
+     description:
+        - Indicate desired state of the resource
+     choices: ['present', 'absent']
+     default: present
+   port_name:
+     description:
+        - Name to be assigned to the port
+     required: true
+     default: None
+   network_name:
+     description:
+        - The name of network where the port should be attached
+     required: true
+     default: None
+   network_id:
+     description:
+        - The id of network where the port should be attached
+     required: false
+     default: None
+   ip_address:
+     description:
+        - The ip to set for that specific port
+     required: false
+     default: None
+requirements: ["neutronclient", "keystoneclient"]
+
+'''
+
+EXAMPLES = '''
+# Create a port and assign a fix ip address to it
+    neutron_port:
+      login_username: admin
+      login_password: admin
+      login_tenant_name: demo
+      auth_url: http://127.0.0.1:35357/v2.0/
+      state: present
+      port_name: "TestPort1"
+      network_name: MgntNet
+      ip_address: "10.1.12.211"
+          
+# Create a port.Let neutron assign the ip address
+        neutron_port:
+      login_username: admin
+      login_password: admin
+      login_tenant_name: demo
+      auth_url: http://127.0.0.1:35357/v2.0/
+      state: present
+      port_name: "TestPort1"
+      network_name: MgntNet       
+'''
+
+_os_keystone = None
+_os_tenant_id = None
+
+def _get_ksclient(module, kwargs):
+    try:
+        kclient = ksclient.Client(
+            username=module.params.get('login_username'),
+            password=module.params.get('login_password'),
+            tenant_name=module.params.get('login_tenant_name'),
+            auth_url=module.params.get('auth_url'),
+            region_name=module.params.get('region_name'))
+    except Exception as e:
+        module.fail_json(msg = "Error authenticating to the keystone: %s" %e.message)
+    global _os_keystone
+    _os_keystone = kclient
+    return kclient
+
+
+def _get_endpoint(module, ksclient):
+    try:
+        endpoint = ksclient.service_catalog.url_for(service_type='network', endpoint_type='publicURL')
+    except Exception as e:
+        module.fail_json(msg = "Error getting endpoint for Neutron: %s " %e.message)
+    return endpoint
+
+def _get_neutron_client(module, kwargs):
+    _ksclient = _get_ksclient(module, kwargs)
+    token = _ksclient.auth_token
+    endpoint = _get_endpoint(module, _ksclient)
+    kwargs = {
+            'token': token,
+            'endpoint_url': endpoint
+    }
+    try:
+        neutron = client.Client('2.0', **kwargs)
+    except Exception as e:
+        module.fail_json(msg = " Error in connecting to Neutron: %s " %e.message)
+    return neutron
+
+def _set_tenant_id(module):
+    global _os_tenant_id
+    if module.params['login_tenant_name']:
+        # We need admin power in order retrieve the tenant_id of a given
+        # tenant name and to create/delete networks for a tenant that is not
+        # the one used to authenticate the user.
+        tenant_name = module.params['login_tenant_name']
+        for tenant in _os_keystone.tenants.list():
+            if tenant.name == tenant_name:
+                _os_tenant_id = tenant.id
+                break
+    else:
+        _os_tenant_id = _os_keystone.tenant_id
+
+    if not _os_tenant_id:
+        module.fail_json(msg = "The tenant id cannot be found, please check the paramters")
+
+# get the network ID by network name. The network ID is used to assign
+# the port to correct network.
+def _get_net_id(neutron, module):
+    kwargs = {
+            'tenant_id': _os_tenant_id,
+            'name': module.params['network_name'],
+    }
+    try:
+        networks = neutron.list_networks(**kwargs)
+    except Exception as e:
+        module.fail_json(msg = "Error in listing Neutron networks: %s" % e.message)
+    if not networks['networks']:
+        return None
+    return networks['networks'][0]['id']
+
+# find out if there is already a port with the specific name.
+def _get_port_id(neutron, module):
+    kwargs = {
+            'tenant_id': _os_tenant_id,
+            'name': module.params['port_name'],
+    }
+    try:
+        ports = neutron.list_ports(**kwargs)
+    except Exception as e:
+        module.fail_json(msg = "Error in listing Neutron ports: %s" % e.message)
+    if not ports['ports']:
+        return None
+    return ports['ports'][0]['id']
+
+# create a port and 
+def _create_port(neutron, module):
+
+    neutron.format = 'json'
+
+    port = {
+        'name': module.params.get('port_name'),
+        'tenant_id': _os_tenant_id,
+        'network_id': module.params.get('network_id'),
+    }
+
+    if module.params['ip_address'] != None:
+        fixed_ips = {"ip_address": module.params.get('ip_address')},
+        port.update({'fixed_ips': fixed_ips})
+
+    try:
+        port = neutron.create_port(dict(port=port))
+    except Exception as e:
+        module.fail_json(msg = "Error in creating port: %s" % e.message)
+    return port['port']['id']
+
+def _delete_port(module, port_id, neutron):
+
+    try:
+        id = neutron.delete_port(port_id)
+    except Exception as e:
+        module.fail_json(msg = "Error in deleting the port: %s" % e.message)
+    return True
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec = dict(
+            login_username = dict(default='admin'),
+            login_password = dict(required=True),
+            login_tenant_name = dict(required='True'),
+            auth_url = dict(default='http://127.0.0.1:35357/v2.0/'),
+            region_name = dict(default=None),
+            port_name = dict(required=True),
+            network_id = dict(default=None),
+            network_name = dict(required=True),
+            ip_address = dict(default=None),
+            state = dict(default='present', choices=['absent', 'present'])
+        ),
+    )
+    neutron = _get_neutron_client(module, module.params)
+
+    _set_tenant_id(module)
+
+    if module.params['state'] == 'present':
+        if module.params['network_id'] != None:
+            network_id = module.params['network_id']
+        else:
+            network_id = _get_net_id(neutron, module)
+
+        if not network_id:
+            module.fail_json(msg = " Network could not be found. Please specify an existing network.")
+        else:
+            module.params['network_id'] = network_id
+            port_id = _get_port_id(neutron, module)
+            if not port_id:
+                port_id = _create_port(neutron, module)
+                module.exit_json(changed = True, result = "Created" , id = port_id)   
+            else:
+                module.exit_json(changed = False, result = "Success", id = port_id)
+
+    if module.params['state'] == 'absent':
+        port_id = _get_port_id(neutron, module)
+        if not port_id:
+            module.exit_json(changed = False, result = "Success")
+        else:
+            _delete_port(module, port_id, neutron)
+            module.exit_json(changed = True, result = "Deleted")
+
+# this is magic, see lib/ansible/module.params['common.py
+from ansible.module_utils.basic import *
+main()
